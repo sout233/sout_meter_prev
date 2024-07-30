@@ -1,0 +1,20 @@
+[package]
+name = "sout_meter"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+atomic_float = "1.0.0"
+audio-visualizer = "0.4.0"
+cpal = "0.15.3"
+hound = "3.4"
+realfft = "3.3.0"
+rustfft = "6.0"
+spectrum-analyzer = "1.5.0"
+vizia = { path = "../vizia_sout_patched/vizia" }
+# vizia = { git = "https://github.com/vizia/vizia", branch = "skia" }
+# egui = "0.28.1"
+# eframe = "0.28.1"
+# egui_plot = "0.28.1"
