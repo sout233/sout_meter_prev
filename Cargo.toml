@@ -7,15 +7,15 @@ edition = "2021"
 
 [dependencies]
 atomic_float = "1.0.0"
-audio-visualizer = "0.4.0"
+# audio-visualizer = "0.4.0"
 cpal = "0.15.3"
-hound = "3.4"
-realfft = "3.3.0"
+# hound = "3.4"
+# realfft = "3.3.0"
 rustfft = "6.0"
-spectrum-analyzer = "1.5.0"
+# spectrum-analyzer = "1.5.0"
 # vizia = { path = "../vizia_sout_patched" }
-# vizia = { git = "https://github.com/vizia/vizia", branch = "skia" }
+vizia = { git = "https://github.com/vizia/vizia"}
 # egui = "0.28.1"
-eframe = "0.28.1"
-egui_plot = "0.28.1"
-image = "0.25.2"
+# eframe = "0.28.1"
+# egui_plot = "0.28.1"
+# image = "0.25.2"
