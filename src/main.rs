@@ -1,9 +1,17 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use pitch_detector::pitch::{HannedFftDetector, PitchDetector};
+use pitch_detection::detector::mcleod::McLeodDetector;
+use pitch_detection::detector::PitchDetector;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use vizia::prelude::*;
 use vizia::vg;
+
+mod utils;
+
+const SIZE: usize = 1024;
+const PADDING: usize = SIZE / 2;
+const POWER_THRESHOLD: f64 = 5.0;
+const CLARITY_THRESHOLD: f64 = 0.7;
 
 fn main() -> Result<(), ApplicationError> {
     let audio_buffer = Arc::new(Mutex::new(Vec::new()));
@@ -90,7 +98,6 @@ pub enum AppEvent {
 pub struct WaveformView<L: Lens<Target = Arc<Mutex<Vec<f32>>>>> {
     input_data: L,
     sample_rate: u32,
-    offest: u128,
 }
 
 impl<L> WaveformView<L>
@@ -101,7 +108,6 @@ where
         Self {
             input_data: data,
             sample_rate: sample_rate,
-            offest: 0,
         }
         .build(cx, |_| {})
         .bind(data, |mut handle, _| handle.needs_redraw())
@@ -112,28 +118,59 @@ impl<L: Lens<Target = Arc<Mutex<Vec<f32>>>>> View for WaveformView<L> {
     fn draw(&self, cx: &mut DrawContext, canvas: &Canvas) {
         let mut data = self.input_data.get(cx).lock().unwrap().clone();
         let bounds = cx.bounds();
-        let max_samples = (bounds.w as usize).min(data.len());
 
-        let mut detector = HannedFftDetector::default();
-        let signal: Vec<f64> = data.clone().iter().map(|&x| x as f64).collect();
-        let sample_rate = self.sample_rate as f64;
-        let signal_len = signal.len();
-        if signal_len > 0 {
-            let freq = detector.detect_pitch(&signal, sample_rate).unwrap_or(-1.0);
+        let mut signal: Vec<f64> = data.iter().map(|&x| x as f64).collect();
+        let mut period_samples = bounds.w as usize; // 随窗口而变
 
-            if freq > 0.0 {
-                data.shrink_to(freq as usize);
+        if !signal.is_empty() {
+            let new_data = utils::pitcher::extract_fundamental_waveform(
+                &signal,
+                self.sample_rate.try_into().unwrap(),
+                SIZE,
+                POWER_THRESHOLD,
+                CLARITY_THRESHOLD,
+            );
+            if let Some(omg) = new_data {
+                data = omg.iter().map(|&x| x as f32).collect();
             }
+
+            // signal.resize(SIZE, 0.0);
+            // let mut detector = McLeodDetector::new(SIZE, PADDING);
+
+            // let sample_rate = self.sample_rate.try_into().unwrap_or(48000);
+            // let pitch = detector.get_pitch(
+            //     &signal,
+            //     sample_rate,
+            //     POWER_THRESHOLD,
+            //     CLARITY_THRESHOLD,
+            // );
+
+            // // 如果检测到有效基频，计算周期样本数
+            // if let Some(pitch) = pitch {
+            //     let calculated_period = (sample_rate as f64 / pitch.frequency) as usize;
+            //     period_samples = calculated_period.max(2); // 两点成线
+
+            //     println!("Base Frequency: {:.2}Hz | Period Samples: {} | Clarity: {:.2}",
+            //         pitch.frequency,
+            //         period_samples,
+            //         pitch.clarity
+            //     );
+            // }
         }
 
-        // Ensure we only render the current window size worth of data
-        if data.len() > max_samples {
-            data.drain(..data.len() - max_samples);
-        }
+        // // 截取或扩展数据到单个周期长度
+        // if data.len() > period_samples {
+        //     // 保留最新一个周期的数据
+        //     data.drain(..data.len() - period_samples);
+        // } else if data.len() < period_samples {
+        //     // 补零，用resize或许也行但是我懒得改了
+        //     data.extend(vec![0.0; period_samples - data.len()]);
+        // }
 
+        // 创建绘图路径
         let mut path = vg::Path::new();
-        let step = if data.len() > 1 {
-            bounds.w / (data.len() - 1) as f32
+        let step = if period_samples > 1 {
+            bounds.w / (period_samples - 1) as f32
         } else {
             0.0
         };
@@ -142,6 +179,7 @@ impl<L: Lens<Target = Arc<Mutex<Vec<f32>>>>> View for WaveformView<L> {
             let x = bounds.x + i as f32 * step;
             let y = bounds.y + bounds.h * (1.0 - value);
             let point = vg::Point::new(x, y);
+
             if i == 0 {
                 path.move_to(point);
             } else {
@@ -149,8 +187,9 @@ impl<L: Lens<Target = Arc<Mutex<Vec<f32>>>>> View for WaveformView<L> {
             }
         }
 
-        let mut binding = vg::Paint::default();
-        let paint = binding.set_style(vg::PaintStyle::Stroke);
+        // 设置画笔并绘制
+        let mut paint = vg::Paint::default();
+        paint.set_style(vg::PaintStyle::Stroke);
         canvas.draw_path(&path, &paint);
     }
 }
