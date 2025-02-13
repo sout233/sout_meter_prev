@@ -2,7 +2,7 @@ use pitch_detection::detector::mcleod::McLeodDetector;
 use pitch_detection::detector::PitchDetector;
 
 /// 提取基础周期波形工具函数
-/// 
+///
 /// # 参数
 /// - `signal`: 原始时域波形数据（&[f64]）
 /// - `sample_rate`: 采样率（单位Hz）
@@ -61,20 +61,27 @@ mod tests {
 
     #[test]
     fn test_sine_wave() {
-        // 生成440Hz正弦波（3个周期）
+        // 生成440Hz正弦波（足够长的信号）
         let sample_rate = 48000;
         let freq = 440.0;
-        let duration = 3.0 / freq;
+        let duration = 0.1; // 延长持续时间至0.1秒，确保信号足够长
         let total_samples = (duration * sample_rate as f64).round() as usize;
-        
+
         let signal: Vec<_> = (0..total_samples)
             .map(|i| (2.0 * std::f64::consts::PI * freq * i as f64 / sample_rate as f64).sin())
             .collect();
 
+        // 确保窗口大小不超过信号长度
+        let window_size = 2048;
+        assert!(total_samples >= window_size, "信号长度需至少等于窗口大小");
+
         // 调用提取函数
-        let fundamental = extract_fundamental_waveform(&signal, sample_rate, 2048, 5.0, 0.7);
+        let fundamental = extract_fundamental_waveform(&signal, sample_rate, window_size, 5.0, 0.7);
 
         assert!(fundamental.is_some());
-        assert_eq!(fundamental.unwrap().len(), (sample_rate as f64 / freq).round() as usize);
+        assert_eq!(
+            fundamental.unwrap().len(),
+            (sample_rate as f64 / freq).round() as usize
+        );
     }
 }
