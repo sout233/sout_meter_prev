@@ -2,6 +2,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rustfft::num_complex::Complex;
 use rustfft::num_traits::Float;
 use rustfft::{FftDirection, FftPlanner};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use vizia::prelude::*;
@@ -187,6 +188,8 @@ where
     fft_buffer: Vec<Complex<f32>>,
     sample_rate: f32,
     max_freq: f32,
+    smoothing_buffer: Arc<Mutex<VecDeque<Vec<f32>>>>,
+    buffer_size: usize,
 }
 
 impl<L> SpectrumView<L>
@@ -194,11 +197,12 @@ where
     L: Lens<Target = Arc<Mutex<Vec<f32>>>>,
 {
     pub fn new(cx: &mut Context, data: L, sample_rate: f32, max_freq: f32) -> Handle<Self> {
-        let fft_size = 4096;
+        let fft_size = 1024;
         let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft(fft_size, FftDirection::Forward);
+        let fft = planner.plan_fft_forward(fft_size);
 
-        let window = (0..fft_size)
+        // 生成汉宁窗 -----------------------------------------------------
+        let window: Vec<f32> = (0..fft_size)
             .map(|i| {
                 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1) as f32).cos())
             })
@@ -211,6 +215,8 @@ where
             fft_buffer: vec![Complex::default(); fft_size],
             sample_rate,
             max_freq: max_freq.min(sample_rate / 2.0 * 0.99), // 保留1%余量
+            smoothing_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(8))),
+            buffer_size: 8,
         }
         .build(cx, |_| {})
         .bind(data, |mut handle, _| handle.needs_redraw())
@@ -224,37 +230,62 @@ impl<L: Lens<Target = Arc<Mutex<Vec<f32>>>>> View for SpectrumView<L> {
         let sample_rate = self.sample_rate;
         let max_freq = self.max_freq;
 
-        // FFT处理（保持原逻辑）
+        // 准备FFT输入数据 -------------------------------------------------
         let mut fft_input = self.fft_buffer.clone();
         let fft_size = 1024;
 
+        // 应用汉宁窗 -----------------------------------------------------
         waveform
             .iter()
             .take(fft_size)
-            .chain(std::iter::repeat(&0.0))
-            .zip(&self.window)
+            .chain(std::iter::repeat(&0.0)) // 不足补零
+            .zip(&self.window) // 这里使用预先生成的汉宁窗
             .take(fft_size)
             .enumerate()
             .for_each(|(i, (s, w))| {
-                fft_input[i] = Complex { re: s * w, im: 0.0 };
+                fft_input[i] = Complex {
+                    re: s * w, // 应用汉宁窗
+                    im: 0.0,
+                };
             });
 
+        // 执行FFT变换 -----------------------------------------------------
         self.fft.process(&mut fft_input);
+
+        let mut magnitudes: Vec<f32> = fft_input
+            .iter()
+            .take(512)
+            .enumerate()
+            .map(|(i, c)| {
+                let scale = if i == 0 || i == 512 - 1 {
+                    2.0 / 1.63
+                } else {
+                    2.0
+                };
+                (c.norm() * scale).max(1e-6)
+            })
+            .collect();
+
+        let mut smoothing_buffer = self.smoothing_buffer.lock().unwrap();
+
+        // 平滑处理
+        smoothing_buffer.push_back(magnitudes);
+        if smoothing_buffer.len() > self.buffer_size {
+            smoothing_buffer.pop_front();
+        }
+
+        let spectrum_db: Vec<f32> = (0..512)
+            .map(|i| {
+                let avg =
+                    smoothing_buffer.iter().map(|v| v[i]).sum::<f32>() / self.buffer_size as f32;
+                20.0 * avg.log10().clamp(-4.5, 1.0) // -90dB到+20dB
+            })
+            .collect();
 
         // 计算显示参数
         let nyquist = sample_rate / 2.0;
         let max_bin = ((max_freq / nyquist) * (fft_size / 2) as f32).floor() as usize;
         let bins_to_draw = max_bin.min(fft_size / 2);
-
-        // 幅度计算
-        let spectrum_db: Vec<f32> = fft_input
-            .iter()
-            .take(bins_to_draw)
-            .map(|c| {
-                let magnitude = (c.re * c.re + c.im * c.im).sqrt();
-                20.0 * (magnitude + 1e-6).log10()
-            })
-            .collect();
 
         // 可视化配置
         let mut paint = vg::Paint::default();
@@ -290,7 +321,9 @@ impl<L: Lens<Target = Arc<Mutex<Vec<f32>>>>> View for SpectrumView<L> {
             let x = bounds.x + x_ratio.clamp(0.0, 1.0) * bounds.w;
 
             // 垂直映射（-90dB到+20dB）
-            let db_normalized = (db + 90.0) / 110.0; // 110 = 20 - (-90)
+            let min_db = -100.0;
+            let max_db = 100.0;
+            let db_normalized = (db - min_db) / (max_db - min_db);
             let y = bounds.y + bounds.h * (1.0 - db_normalized.clamp(0.0, 1.0));
 
             path.move_to(vg::Point::new(x, y));
