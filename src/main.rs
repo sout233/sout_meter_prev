@@ -1,4 +1,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use rustfft::num_complex::Complex;
+use rustfft::num_traits::Float;
+use rustfft::{FftDirection, FftPlanner};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use vizia::prelude::*;
@@ -32,7 +35,7 @@ fn main() -> Result<(), ApplicationError> {
         let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
             let mut buffer = buffer_clone.lock().unwrap();
             // Downsample 但是 factor 10
-            let downsampled_data: Vec<f32> = data.iter().step_by(10).copied().collect();
+            let downsampled_data: Vec<f32> = data.iter().step_by(1).copied().collect();
             let buffer_len = buffer.len();
             if buffer_len > 1024 {
                 buffer.drain(..buffer_len - 1024);
@@ -64,9 +67,9 @@ fn main() -> Result<(), ApplicationError> {
                 .size(Pixels(800.0))
                 .height(Pixels(150.0));
 
-            SpectrumView::new(cx, AppData::waveform, sample_rate)
+            SpectrumView::new(cx, AppData::waveform, sample_rate as f32, 20000.0)
                 .size(Pixels(800.0))
-                .height(Pixels(150.0));
+                .height(Pixels(300.0));
         });
 
         let timer = cx.add_timer(Duration::from_millis(33), None, |cx, _| {
@@ -179,17 +182,35 @@ where
     L: Lens<Target = Arc<Mutex<Vec<f32>>>>,
 {
     input_data: L,
-    sample_rate: u32,
+    fft: Arc<dyn rustfft::Fft<f32>>,
+    window: Vec<f32>,
+    fft_buffer: Vec<Complex<f32>>,
+    sample_rate: f32,
+    max_freq: f32,
 }
 
 impl<L> SpectrumView<L>
 where
     L: Lens<Target = Arc<Mutex<Vec<f32>>>>,
 {
-    pub fn new(cx: &mut Context, data: L, sample_rate: u32) -> Handle<Self> {
+    pub fn new(cx: &mut Context, data: L, sample_rate: f32, max_freq: f32) -> Handle<Self> {
+        let fft_size = 4096;
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft(fft_size, FftDirection::Forward);
+
+        let window = (0..fft_size)
+            .map(|i| {
+                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1) as f32).cos())
+            })
+            .collect();
+
         Self {
             input_data: data,
-            sample_rate: sample_rate,
+            fft,
+            window,
+            fft_buffer: vec![Complex::default(); fft_size],
+            sample_rate,
+            max_freq: max_freq.min(sample_rate / 2.0 * 0.99), // 保留1%余量
         }
         .build(cx, |_| {})
         .bind(data, |mut handle, _| handle.needs_redraw())
@@ -200,78 +221,83 @@ impl<L: Lens<Target = Arc<Mutex<Vec<f32>>>>> View for SpectrumView<L> {
     fn draw(&self, cx: &mut DrawContext, canvas: &Canvas) {
         let waveform = self.input_data.get(cx).lock().unwrap().clone();
         let bounds = cx.bounds();
+        let sample_rate = self.sample_rate;
+        let max_freq = self.max_freq;
 
-        // 时域转频域（含-120dB下限）
-        let spectrum = utils::spectrum::time_to_frequency(&waveform, -120.0);
+        // FFT处理（保持原逻辑）
+        let mut fft_input = self.fft_buffer.clone();
+        let fft_size = 1024;
 
-        // 斜率优化 (-6dB/oct)
-        let optimized =
-            utils::spectrum::optimize_slope(&spectrum, self.sample_rate as f32, -6.0, 1000.0);
+        waveform
+            .iter()
+            .take(fft_size)
+            .chain(std::iter::repeat(&0.0))
+            .zip(&self.window)
+            .take(fft_size)
+            .enumerate()
+            .for_each(|(i, (s, w))| {
+                fft_input[i] = Complex { re: s * w, im: 0.0 };
+            });
 
-        // 生成三段式对数频率轴
-        let (new_freqs, new_spectrum) = utils::spectrum::optimize_xaxis(
-            &optimized,
-            self.sample_rate as f32,
-            100.0,  // 低频分界
-            1000.0, // 中频分界
-            100,    // 低频点数
-            200,    // 中频点数
-            50,     // 高频点数
-        );
+        self.fft.process(&mut fft_input);
 
-        // 空数据检查
-        if new_freqs.is_empty() || new_spectrum.is_empty() {
-            return;
-        }
+        // 计算显示参数
+        let nyquist = sample_rate / 2.0;
+        let max_bin = ((max_freq / nyquist) * (fft_size / 2) as f32).floor() as usize;
+        let bins_to_draw = max_bin.min(fft_size / 2);
 
-        // 坐标映射参数计算
-        let min_freq = new_freqs[0].max(1e-6); // 防零保护
-        let max_freq = *new_freqs.last().unwrap();
-        let ln_range = max_freq.ln() - min_freq.ln();
-        let db_min = -120.0; // 与time_to_frequency的floor保持一致
-        let db_max = 0.0;
+        // 幅度计算
+        let spectrum_db: Vec<f32> = fft_input
+            .iter()
+            .take(bins_to_draw)
+            .map(|c| {
+                let magnitude = (c.re * c.re + c.im * c.im).sqrt();
+                20.0 * (magnitude + 1e-6).log10()
+            })
+            .collect();
 
-        // 创建频谱路径
-        let mut path = vg::Path::new();
-        let mut last_point: Option<vg::Point> = None;
-
-        for (freq, db) in new_freqs.iter().zip(new_spectrum.iter()) {
-            // 对数频率映射到X轴
-            let x_progress = (freq.ln() - min_freq.ln()) / ln_range;
-            let x = bounds.x + x_progress * bounds.w;
-
-            // 分贝值映射到Y轴（上下留5%边距）
-            let y_height = (db.clamp(db_min, db_max) - db_min) / (db_max - db_min);
-            let y = bounds.y + bounds.h * 0.95 - y_height * bounds.h * 0.9;
-
-            let point = vg::Point::new(x, y);
-
-            if let Some(last) = last_point {
-                // 添加贝塞尔曲线控制点实现平滑
-                let ctrl_x = (last.x + point.x) / 2.0;
-                path.quad_to(vg::Point::new(ctrl_x, last.y), point);
-            } else {
-                path.move_to(point);
-            }
-            last_point = Some(point);
-        }
-
-        // 配置画笔属性
+        // 可视化配置
         let mut paint = vg::Paint::default();
         paint.set_style(vg::PaintStyle::Stroke);
-        // paint.set_color(vg::Color::from_rgb(0.0, 0.8, 0.2)); // 荧光绿
+        paint.set_color(vg::Color::from_rgb(100, 200, 100));
+        paint.set_stroke_width((bounds.w / bins_to_draw as f32).max(1.0));
 
         let mut path = vg::Path::new();
 
-        spectrum.iter().enumerate().for_each(|(i, db)| {
+        // 三段式频率轴参数
+        let low_cutoff = 200.0; // 低频/中频分界
+        let mid_cutoff = 2000.0; // 中频/高频分界
+        let log_low_base = (low_cutoff + 1.0).ln(); // 低频段使用自然对数
+        let log_mid_base = (mid_cutoff / low_cutoff).log10(); // 中频段使用log10
+        let log_high_base = (max_freq / mid_cutoff).log10(); // 高频段使用log10
 
+        spectrum_db.iter().enumerate().for_each(|(i, db)| {
+            // 计算实际频率
+            let freq = i as f32 * nyquist / bins_to_draw as f32;
+
+            // 三段式对数映射
+            let x_ratio = if freq <= low_cutoff {
+                // 低频段（0-200Hz）：自然对数映射
+                (freq + 1.0).ln() / log_low_base * 0.3
+            } else if freq <= mid_cutoff {
+                // 中频段（200-2000Hz）：log10映射
+                0.3 + (freq.log10() - low_cutoff.log10()) / log_mid_base * 0.4
+            } else {
+                // 高频段（2000-20000Hz）：log10映射
+                0.7 + (freq.log10() - mid_cutoff.log10()) / log_high_base * 0.3
+            };
+
+            let x = bounds.x + x_ratio.clamp(0.0, 1.0) * bounds.w;
+
+            // 垂直映射（-90dB到+20dB）
+            let db_normalized = (db + 90.0) / 110.0; // 110 = 20 - (-90)
+            let y = bounds.y + bounds.h * (1.0 - db_normalized.clamp(0.0, 1.0));
+
+            path.move_to(vg::Point::new(x, y));
+            path.line_to(vg::Point::new(x, bounds.y + bounds.h));
         });
 
-        // 执行绘制
         canvas.draw_path(&path, &paint);
-
-        // 可选：添加背景网格和刻度（此处需要额外实现）
-        // self.draw_grid(cx, canvas, min_freq, max_freq);
     }
 }
 
